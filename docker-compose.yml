@@ -1,0 +1,108 @@
+services:
+
+  # ── Postgres ──────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ash_delta_demo
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ash_delta_demo"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Postgres GUI (Adminer) ─────────────────────────────────────────────────────
+  adminer:
+    image: adminer:latest
+    restart: unless-stopped
+    ports:
+      - "8090:8080"   # http://localhost:8090  (server=postgres, user=postgres, pw=postgres)
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── SeaweedFS (S3-compatible object store + web UIs) ──────────────────────────
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    restart: unless-stopped
+    command: >
+      server
+        -dir=/data
+        -s3
+        -s3.port=8333
+        -filer
+        -master.volumeSizeLimitMB=512
+    ports:
+      - "9333:9333"   # master + cluster UI  →  http://localhost:9333
+      - "8080:8080"   # volume server
+      - "8888:8888"   # filer / file-browser UI  →  http://localhost:8888
+      - "8333:8333"   # S3 API  →  http://localhost:8333
+    volumes:
+      - seaweedfs_data:/data
+
+  # ── Create the S3 bucket on first start ───────────────────────────────────────
+  bucket-init:
+    image: amazon/aws-cli:latest
+    restart: "no"
+    depends_on:
+      seaweedfs:
+        condition: service_started
+    environment:
+      AWS_ACCESS_KEY_ID: any
+      AWS_SECRET_ACCESS_KEY: any
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until aws --endpoint-url http://seaweedfs:8333 s3 ls >/dev/null 2>&1; do
+          echo "waiting for SeaweedFS S3..."; sleep 3;
+        done
+        aws --endpoint-url http://seaweedfs:8333 s3 mb s3://demo-lake 2>/dev/null || true
+        echo "bucket ready"
+
+  # ── Livebook ──────────────────────────────────────────────────────────────────
+  livebook:
+    image: ghcr.io/livebook-dev/livebook:latest
+    restart: unless-stopped
+    ports:
+      - "4000:4000"   # http://localhost:4000  (password: livebookdemo)
+    environment:
+      LIVEBOOK_PORT: "4000"
+      LIVEBOOK_IP: "0.0.0.0"
+      LIVEBOOK_TOKEN_ENABLED: "false"
+      LIVEBOOK_PASSWORD: livebookdemo
+      LIVEBOOK_HOME: /data
+      # Postgres
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/ash_delta_demo"
+      # S3 / SeaweedFS
+      AWS_ACCESS_KEY_ID: any
+      AWS_SECRET_ACCESS_KEY: any
+      AWS_REGION: us-east-1
+      S3_HOST: seaweedfs
+      S3_PORT: "8333"
+      S3_SCHEME: "http://"
+    volumes:
+      # The ash_delta project is mounted at /data so that:
+      #   • {ash_delta, path: "/data/"} in Mix.install resolves correctly
+      #   • ash_delta_demo.livemd is visible as the Livebook home directory
+      - /home/dj/Projects/ash_delta:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bucket-init:
+        condition: service_completed_successfully
+      seaweedfs:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  seaweedfs_data:

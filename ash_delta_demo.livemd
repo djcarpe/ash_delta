@@ -1,0 +1,758 @@
+# AshDelta: Delta Lake-style Data Layer for Ash
+
+## Section
+
+```elixir
+Application.put_env(:ash, :validate_domain_resource_inclusion?, false)
+Application.put_env(:ash, :validate_domain_config_inclusion?, false)
+
+Mix.install(
+  [
+    {:ash_delta, path: "/data/"},
+    {:ash, "~> 3.0"},
+    {:ecto_sql, "~> 3.11"},
+    {:postgrex, "~> 0.19"},
+    {:explorer, "~> 0.10"},
+    {:duckdbex, "~> 0.3"},
+    {:ex_aws, "~> 2.5"},
+    {:ex_aws_s3, "~> 2.5"},
+    {:jason, "~> 1.4"},
+    {:uniq, "~> 0.6"},
+    {:benchee, "~> 1.3"}
+  ],
+  consolidate_protocols: false
+)
+```
+
+```elixir
+# ── Postgres ─────────────────────────────────────────────────────────────────
+# DATABASE_URL is set by Docker Compose; the default works for local runs.
+Application.put_env(:demo, Demo.Repo,
+  url: System.get_env("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/ash_delta_demo"),
+  pool_size: 5
+)
+
+defmodule Demo.Repo do
+  use Ecto.Repo, otp_app: :demo, adapter: Ecto.Adapters.Postgres
+end
+
+Demo.Repo.start_link()
+
+# ── S3 / SeaweedFS ───────────────────────────────────────────────────────────
+# ExAws global config — used by maintenance/vacuum (delete_object calls).
+# S3_HOST / S3_PORT / S3_SCHEME are set by Docker Compose; defaults hit
+# a local SeaweedFS or MinIO on port 8333.
+Application.put_env(:ex_aws, :access_key_id,     System.get_env("AWS_ACCESS_KEY_ID", "any"))
+Application.put_env(:ex_aws, :secret_access_key, System.get_env("AWS_SECRET_ACCESS_KEY", "any"))
+Application.put_env(:ex_aws, :region,            System.get_env("AWS_REGION", "us-east-1"))
+Application.put_env(:ex_aws, :s3, [
+  scheme: System.get_env("S3_SCHEME", "http://"),
+  host:   System.get_env("S3_HOST", "localhost"),
+  port:   System.get_env("S3_PORT", "8333") |> String.to_integer()
+])
+```
+
+## What Is AshDelta?
+
+`AshDelta` is an Ash data layer that brings [Delta Lake](https://delta.io/) semantics to Elixir. It stores data as sorted, partitioned **Parquet files on S3**, tracks the transaction log and file manifest in **Postgres**, and executes columnar scans through **DuckDB**.
+
+The result: an append-optimised, analytically efficient table format — accessible through the same Ash API you use for any other resource.
+
+### How it maps to Delta Lake
+
+| Delta Lake concept        | AshDelta implementation                                     |
+| ------------------------- | ----------------------------------------------------------- |
+| `_delta_log/*.json`       | `delta_commits` table — one row per version               |
+| Add / Remove file actions | `delta_files` rows with `added_version` / `removed_version` |
+| Optimistic concurrency    | `SELECT … FOR UPDATE` on `delta_tables.current_version`   |
+| Data skipping (stats)     | JSONB `min` / `max` / `null_count` + GIN indexes            |
+| Partition pruning         | `partition_values` JSONB containment queries                |
+| Time travel               | Snapshot reconstruction at any version or timestamp         |
+| OPTIMIZE (compaction)     | `AshDelta.optimize/2`                                       |
+| VACUUM                    | `AshDelta.vacuum/2`                                         |
+| Checkpoints               | Not needed — Postgres *is* the materialised state         |
+
+Because the log lives in Postgres rather than JSON files to be replayed, snapshot reconstruction is a **single indexed query**. Commits are serialised per-table via a row lock; the heavy S3 upload happens *before* the lock, so the critical section is just a few metadata inserts.
+
+## Infrastructure
+
+AshDelta needs three services:
+
+| Service              | Role                                        | Local option                |
+| -------------------- | ------------------------------------------- | --------------------------- |
+| **Postgres**         | Transaction log, file catalog, column stats | Docker image `postgres:16`  |
+| **S3 or compatible** | Parquet data files                          | [MinIO](https://min.io)     |
+| **DuckDB**           | Columnar scans inside each Parquet file     | Embedded via `duckdbex` NIF |
+
+Run the migrations once to create the catalog tables:
+
+```elixir
+try do
+  AshDelta.Migrations.run(Demo.Repo)
+  IO.puts("Migrations applied.")
+rescue
+  e -> IO.puts("Already applied: #{Exception.message(e)}")
+end
+```
+
+Which creates:
+
+```sql
+CREATE TABLE delta_tables (
+  id              BIGSERIAL PRIMARY KEY,
+  resource        TEXT NOT NULL UNIQUE,
+  bucket          TEXT NOT NULL,
+  prefix          TEXT NOT NULL,
+  current_version BIGINT NOT NULL DEFAULT 0
+);
+
+CREATE TABLE delta_commits (
+  id                BIGSERIAL PRIMARY KEY,
+  table_id          BIGINT REFERENCES delta_tables(id),
+  version           BIGINT NOT NULL,
+  operation         TEXT NOT NULL,
+  operation_params  JSONB NOT NULL DEFAULT '{}',
+  committed_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE delta_files (
+  id               BIGSERIAL PRIMARY KEY,
+  table_id         BIGINT REFERENCES delta_tables(id),
+  path             TEXT NOT NULL,
+  size_bytes       BIGINT,
+  row_count        BIGINT,
+  partition_values JSONB NOT NULL DEFAULT '{}',
+  column_stats     JSONB NOT NULL DEFAULT '{}',
+  added_version    BIGINT NOT NULL,
+  removed_version  BIGINT
+);
+```
+
+## The Domain: IoT Telemetry
+
+Sensor readings are a classic append-heavy, time-series workload — exactly what Delta Lake was designed for. We'll partition by site and day, collect stats on the measurement columns, and sort within each file to maximise file skipping.
+
+```elixir
+defmodule Demo.Telemetry.Event do
+  use Ash.Resource,
+    domain: Demo.Telemetry,
+    data_layer: AshDelta.DataLayer
+
+  delta do
+    # Ecto repo for the transaction log and file catalog.
+    repo Demo.Repo
+
+    # S3 bucket for Parquet data files.
+    bucket "demo-lake"
+
+    # Key prefix within the bucket.
+    prefix "telemetry/events"
+
+    # Hive-style partitioning creates sub-paths like:
+    #   site=CHI/day=2026-06-11/part-<uuid7>.parquet
+    # Equality / IN predicates on these columns skip entire folders.
+    partition_by [:site, :day]
+
+    # Rows are sorted by these columns inside each Parquet file.
+    # Tight ordering tightens the per-file min/max stats, so more
+    # files get skipped during range queries.
+    sort_within_files [:sensor_id, :recorded_at]
+
+    # AshDelta collects min / max / null_count for these columns
+    # and stores them as JSONB in delta_files.column_stats.
+    stats_columns [:recorded_at, :sensor_id, :value]
+
+    # OPTIMIZE rewrites files until they reach this target size.
+    target_file_size_mb 128
+
+    # VACUUM only deletes S3 objects tombstoned at least this long ago.
+    vacuum_retention_hours 168
+
+    # S3 credentials and endpoint. Reads from env vars so the same notebook
+    # works both inside Docker Compose and against a local object store.
+    s3_config access_key_id:     System.get_env("AWS_ACCESS_KEY_ID", "any"),
+              secret_access_key: System.get_env("AWS_SECRET_ACCESS_KEY", "any"),
+              region:            System.get_env("AWS_REGION", "us-east-1"),
+              endpoint:          "#{System.get_env("S3_SCHEME", "http://")}#{System.get_env("S3_HOST", "localhost")}:#{System.get_env("S3_PORT", "8333")}"
+  end
+
+  attributes do
+    uuid_primary_key :id
+
+    attribute :site,        :string,            allow_nil?: false, public?: true
+    attribute :day,         :date,              allow_nil?: false, public?: true
+    attribute :sensor_id,   :string,            public?: true
+    attribute :recorded_at, :utc_datetime_usec, public?: true
+    attribute :value,       :float,             public?: true
+    attribute :unit,        :atom,              public?: true
+    attribute :metadata,    :map,               public?: true
+  end
+
+  actions do
+    defaults [:read, :create, :destroy]
+    default_accept [:site, :day, :sensor_id, :recorded_at, :value, :unit, :metadata]
+  end
+end
+
+defmodule Demo.Telemetry do
+  use Ash.Domain, validate_config_inclusion?: false
+
+  resources do
+    resource Demo.Telemetry.Event
+    resource Demo.Telemetry.DailySummary
+  end
+end
+```
+
+## Introspection
+
+All delta configuration is accessible at runtime through `AshDelta.Info`:
+
+```elixir
+{:ok, bucket}        = AshDelta.Info.bucket(Demo.Telemetry.Event)
+{:ok, prefix}        = AshDelta.Info.prefix(Demo.Telemetry.Event)
+{:ok, partition_by}  = AshDelta.Info.partition_by(Demo.Telemetry.Event)
+{:ok, sort_by}       = AshDelta.Info.sort_within_files(Demo.Telemetry.Event)
+{:ok, stats_cols}    = AshDelta.Info.stats_columns(Demo.Telemetry.Event)
+
+IO.puts("Bucket:         #{bucket}")
+IO.puts("Prefix:         #{prefix}")
+IO.puts("Partitions:     #{inspect(partition_by)}")
+IO.puts("Sort within:    #{inspect(sort_by)}")
+IO.puts("Stats columns:  #{inspect(stats_cols)}")
+```
+
+```elixir
+# The logical catalog name — used as the resource column in delta_tables.
+# Defaults to the snake_case of the last module segment.
+AshDelta.Info.table_name(Demo.Telemetry.Event)
+```
+
+```elixir
+# Every column eligible for data skipping (stats columns + partition columns)
+AshDelta.Info.skippable_columns(Demo.Telemetry.Event)
+```
+
+```elixir
+# Build an s3:// URI for an arbitrary key within this resource's location
+AshDelta.Info.s3_uri(Demo.Telemetry.Event, "site=CHI/day=2026-06-11/part-abc.parquet")
+```
+
+## Records → DataFrame (Explorer / Polars)
+
+When writing, AshDelta converts Ash records into an Explorer DataFrame backed by [Polars](https://pola.rs). We can run this locally without S3 or Postgres to understand the transformation.
+
+```elixir
+alias Explorer.{DataFrame, Series}
+
+# Construct some sample records
+sample_records = [
+  %Demo.Telemetry.Event{
+    id: Uniq.UUID.uuid7(),
+    site: "CHI", day: ~D[2026-06-11],
+    sensor_id: "sensor_001",
+    recorded_at: ~U[2026-06-11 08:00:00.000000Z],
+    value: 22.4, unit: :celsius, metadata: %{"quality" => "good"}
+  },
+  %Demo.Telemetry.Event{
+    id: Uniq.UUID.uuid7(),
+    site: "CHI", day: ~D[2026-06-11],
+    sensor_id: "sensor_002",
+    recorded_at: ~U[2026-06-11 08:01:00.000000Z],
+    value: 18.9, unit: :celsius, metadata: %{"quality" => "good"}
+  },
+  %Demo.Telemetry.Event{
+    id: Uniq.UUID.uuid7(),
+    site: "NYC", day: ~D[2026-06-11],
+    sensor_id: "sensor_010",
+    recorded_at: ~U[2026-06-11 08:00:30.000000Z],
+    value: 24.1, unit: :celsius, metadata: %{"quality" => "fair"}
+  }
+]
+
+df = AshDelta.Writer.to_dataframe(Demo.Telemetry.Event, sample_records)
+df
+```
+
+```elixir
+# Maps and atoms are serialised as JSON text so they round-trip through
+# Ash.Type.cast_stored on the read path.
+df["unit"]
+```
+
+### Partition grouping
+
+Before writing, records are grouped by their `partition_by` values. Each group becomes a separate Parquet file with its own hive-style path:
+
+```elixir
+{:ok, partition_by} = AshDelta.Info.partition_by(Demo.Telemetry.Event)
+
+groups =
+  sample_records
+  |> Enum.group_by(fn r -> Map.new(partition_by, &{&1, Map.get(r, &1)}) end)
+
+for {partition_values, group} <- groups do
+  IO.puts("Partition #{inspect(partition_values)}: #{length(group)} row(s)")
+end
+```
+
+### Sorting within files
+
+Inside each partition group, records are sorted by `sort_within_files` before encoding. This tightens the min/max statistics per Parquet row-group, so DuckDB can skip more row-groups during a scan:
+
+```elixir
+{:ok, sort_by} = AshDelta.Info.sort_within_files(Demo.Telemetry.Event)
+
+# The writer applies this sort using DataFrame.sort_with/2
+chi_df =
+  sample_records
+  |> Enum.filter(&(&1.site == "CHI"))
+  |> then(&AshDelta.Writer.to_dataframe(Demo.Telemetry.Event, &1))
+  |> DataFrame.sort_with(fn ldf ->
+    Enum.map(sort_by, &{:asc, ldf[to_string(&1)]})
+  end)
+
+chi_df
+```
+
+## Column Statistics
+
+Before committing, AshDelta collects `min`, `max`, and `null_count` for every `stats_column`. These are stored as JSONB in `delta_files.column_stats` and used later to skip files that cannot contain matching rows.
+
+```elixir
+stats = AshDelta.Writer.collect_stats(Demo.Telemetry.Event, df)
+IO.inspect(stats, label: "column_stats (stored per file in Postgres)")
+```
+
+### How the Pruner uses these stats
+
+When you query with a range filter:
+
+```elixir
+require Ash.Query
+
+Demo.Telemetry.Event
+|> Ash.Query.filter(recorded_at >= ^~U[2026-06-11 06:00:00Z])
+|> Ash.read!()
+```
+
+The Pruner translates the Ash filter into a Postgres predicate over `delta_files`:
+
+```sql
+(column_stats->'recorded_at'->>'min')::numeric IS NULL
+  OR (column_stats->'recorded_at'->>'max')::numeric >= $3
+```
+
+Files where `max(recorded_at) < query_start` are excluded before DuckDB opens them. The `sort_within_files` ordering maximises the effect: tightly sorted files have narrow min/max ranges, so more files get eliminated.
+
+## The Write Path
+
+When `Ash.create/1` or `Ash.bulk_create/2` is called:
+
+1. Group records by `partition_by` values
+2. Sort each group by `sort_within_files`
+3. Convert to DataFrame, zstd-compress, write as Parquet to S3
+4. Collect min/max/null_count for `stats_columns`
+5. `SELECT current_version … FOR UPDATE` on `delta_tables` (begin commit lock)
+6. Insert into `delta_files`, increment `current_version` (end commit lock)
+
+The S3 upload (the expensive part) happens *outside* the lock. The critical section is a handful of metadata inserts — microseconds.
+
+```elixir
+# Single create (appends one Parquet file — fine for low-rate writes):
+{:ok, event} =
+  Demo.Telemetry.Event
+  |> Ash.Changeset.for_create(:create, %{
+    site: "CHI",
+    day: ~D[2026-06-11],
+    sensor_id: "sensor_001",
+    recorded_at: ~U[2026-06-11 08:00:00.000000Z],
+    value: 22.4,
+    unit: :celsius
+  })
+  |> Ash.create()
+```
+
+```elixir
+# For high-throughput ingestion, prefer bulk_create — one file per batch:
+readings = [
+  %{site: "NYC", day: ~D[2026-06-11], sensor_id: "sensor_010",
+    recorded_at: ~U[2026-06-11 08:00:30.000000Z], value: 24.1, unit: :celsius},
+  %{site: "NYC", day: ~D[2026-06-11], sensor_id: "sensor_011",
+    recorded_at: ~U[2026-06-11 08:01:00.000000Z], value: 23.7, unit: :celsius}
+]
+
+Ash.bulk_create(readings, Demo.Telemetry.Event, :create,
+  return_records?: true,
+  return_errors?: true
+)
+```
+
+```elixir
+# ── 1 M record bulk load ────────────────────────────────────────────────────
+# Generate data partition-by-partition so each Parquet file lands ~4 000 rows
+# rather than many tiny shards.  8 sites × 30 days = 240 partitions.
+
+sites   = ~w[CHI NYC LAX SFO BOS SEA DEN ATL]
+days    = Enum.map(0..29, &Date.add(~D[2026-01-01], &1))
+sensors = Enum.map(1..50, &"sensor_#{String.pad_leading(to_string(&1), 3, "0")}")
+
+rows_per_partition = 4_167          # 240 × 4 167 ≈ 1 000 080 total
+partitions         = for s <- sites, d <- days, do: {s, d}
+
+IO.puts("Inserting ~#{length(partitions) * rows_per_partition} records " <>
+        "across #{length(partitions)} partitions…")
+
+{us, _} =
+  :timer.tc(fn ->
+    partitions
+    |> Enum.with_index(1)
+    |> Enum.each(fn {{site, day}, i} ->
+      if rem(i, 40) == 0,
+        do: IO.puts("  #{i}/#{length(partitions)} partitions written…")
+
+      rows =
+        for _ <- 1..rows_per_partition do
+          h = :rand.uniform(24) - 1
+          m = :rand.uniform(60) - 1
+          s = :rand.uniform(60) - 1
+
+          %{
+            site:        site,
+            day:         day,
+            sensor_id:   Enum.random(sensors),
+            recorded_at: DateTime.new!(day, Time.new!(h, m, s, 0), "Etc/UTC"),
+            value:       :rand.uniform() * 40 + 10,
+            unit:        if(:rand.uniform() > 0.5, do: :celsius, else: :fahrenheit)
+          }
+        end
+
+      Ash.bulk_create(rows, Demo.Telemetry.Event, :create,
+        return_records?: false,
+        return_errors?: false
+      )
+    end)
+  end)
+
+IO.puts("Done in #{Float.round(us / 1_000_000, 1)} s")
+IO.puts("#{length(AshDelta.snapshot(Demo.Telemetry.Event))} Parquet files in the catalog")
+```
+
+## The Read Path
+
+Reads go through three phases:
+
+1. **Version resolution** — determine which version to read (current, specific version, or timestamp)
+2. **File pruning** — Postgres query against `delta_files` using partition stats and column stats to return only candidate file paths
+3. **DuckDB scan** — `SELECT … FROM read_parquet([…]) WHERE <filter> ORDER BY … LIMIT …` with DuckDB's own row-group-level predicate pushdown
+
+```elixir
+require Ash.Query
+
+Demo.Telemetry.Event
+|> Ash.Query.filter(site == "CHI")
+|> Ash.Query.filter(recorded_at >= ^~U[2026-06-11 00:00:00Z])
+|> Ash.Query.sort(recorded_at: :asc)
+|> Ash.Query.limit(100)
+|> Ash.read!()
+```
+
+The DuckDB SQL the Reader generates looks like:
+
+```sql
+SELECT "id", "site", "day", "sensor_id", "recorded_at", "value", "unit", "metadata"
+FROM read_parquet(['s3://demo-lake/telemetry/events/site=CHI/day=2026-06-11/part-abc.parquet'], union_by_name = true)
+WHERE "site" = ?
+  AND "recorded_at" >= ?
+ORDER BY "recorded_at" ASC
+LIMIT 100
+```
+
+## Time Travel
+
+AshDelta lets you reconstruct the table at any past version or timestamp. Set the target in query context — no extra tables or snapshots required.
+
+```elixir
+require Ash.Query
+
+# Read at a specific version number
+Demo.Telemetry.Event
+|> Ash.Query.set_context(%{delta: %{version: 1}})
+|> Ash.read!()
+```
+
+```elixir
+require Ash.Query
+
+# Read as the table appeared at a UTC timestamp
+Demo.Telemetry.Event
+|> Ash.Query.set_context(%{delta: %{as_of: ~U[2026-06-11 00:00:00Z]}})
+|> Ash.read!()
+```
+
+```elixir
+# Browse the commit log
+AshDelta.history(Demo.Telemetry.Event, limit: 20)
+```
+
+```elixir
+# List all live files at the current version
+AshDelta.snapshot(Demo.Telemetry.Event)
+```
+
+## Benchmarks
+
+After loading 1 M rows (8 sites × 30 days = 240 partitions, ~4 167 rows/file), these benchmarks show how partition pruning and column-stats pruning collapse query latency.
+
+**What the pruner eliminates before DuckDB opens a single file:**
+
+| Query                                            | Files read | Rows scanned |
+| ------------------------------------------------ | ---------- | ------------ |
+| Exact partition `site=CHI AND day=2026-01-15`    | 1 / 240    | ~4 k         |
+| Site filter `site=CHI`                           | 30 / 240   | ~125 k       |
+| 6-day range `site=CHI AND day ∈ [Jan 10–15]` | 6 / 240    | ~25 k        |
+| `value > 45` (column-stats prune)                | varies     | varies       |
+| Full scan (no filter)                            | 240 / 240  | ~1 M         |
+
+```elixir
+require Ash.Query
+
+snapshot = AshDelta.snapshot(Demo.Telemetry.Event)
+IO.puts("#{length(snapshot)} Parquet files, " <>
+        "#{Enum.sum(Enum.map(snapshot, & &1.row_count))} total rows\n")
+
+Benchee.run(
+  %{
+    "exact partition — 1 file" => fn ->
+      Demo.Telemetry.Event
+      |> Ash.Query.filter(site == "CHI" and day == ^~D[2026-01-15])
+      |> Ash.read!()
+    end,
+
+    "site filter — 30 files" => fn ->
+      Demo.Telemetry.Event
+      |> Ash.Query.filter(site == "CHI")
+      |> Ash.Query.limit(500)
+      |> Ash.read!()
+    end,
+
+    "site + 6-day range — 6 files" => fn ->
+      Demo.Telemetry.Event
+      |> Ash.Query.filter(site == "CHI" and day >= ^~D[2026-01-10] and day <= ^~D[2026-01-15])
+      |> Ash.read!()
+    end,
+
+    "value > 45 (col-stats prune)" => fn ->
+      Demo.Telemetry.Event
+      |> Ash.Query.filter(value > 45.0)
+      |> Ash.Query.limit(500)
+      |> Ash.read!()
+    end,
+
+    "top-100 sorted (all files, LIMIT pushdown)" => fn ->
+      Demo.Telemetry.Event
+      |> Ash.Query.sort(recorded_at: :asc)
+      |> Ash.Query.limit(100)
+      |> Ash.read!()
+    end,
+
+    "full scan — 240 files" => fn ->
+      Demo.Telemetry.Event
+      |> Ash.Query.limit(500)
+      |> Ash.read!()
+    end,
+  },
+  time: 5,
+  warmup: 2,
+  memory_time: 2,
+  print: [fast_warning: false]
+)
+```
+
+```elixir
+# Write throughput — time to bulk-insert one partition worth of rows
+require Ash.Query
+
+sensors = Enum.map(1..50, &"sensor_#{String.pad_leading(to_string(&1), 3, "0")}")
+
+rows_1k =
+  for _ <- 1..1_000 do
+    h = :rand.uniform(24) - 1
+    m = :rand.uniform(60) - 1
+    s = :rand.uniform(60) - 1
+    %{site: "BEN", day: ~D[2026-03-01], sensor_id: Enum.random(sensors),
+      recorded_at: DateTime.new!(~D[2026-03-01], Time.new!(h, m, s, 0), "Etc/UTC"),
+      value: :rand.uniform() * 40 + 10, unit: :celsius}
+  end
+
+rows_10k = List.duplicate(hd(rows_1k), 10_000)
+           |> Enum.map(fn r ->
+             h = :rand.uniform(24) - 1
+             m = :rand.uniform(60) - 1
+             s = :rand.uniform(60) - 1
+             %{r | sensor_id: Enum.random(sensors),
+               recorded_at: DateTime.new!(~D[2026-03-01], Time.new!(h, m, s, 0), "Etc/UTC"),
+               value: :rand.uniform() * 40 + 10}
+           end)
+
+Benchee.run(
+  %{
+    "bulk_create 1 k rows" => fn ->
+      Ash.bulk_create(rows_1k, Demo.Telemetry.Event, :create,
+        return_records?: false, return_errors?: false)
+    end,
+    "bulk_create 10 k rows" => fn ->
+      Ash.bulk_create(rows_10k, Demo.Telemetry.Event, :create,
+        return_records?: false, return_errors?: false)
+    end,
+  },
+  time: 10,
+  warmup: 1,
+  print: [fast_warning: false]
+)
+```
+
+## Maintenance
+
+### OPTIMIZE: compaction
+
+Repeated single-row appends leave many small Parquet files. OPTIMIZE rewrites them into `target_file_size_mb`-sized files and commits remove-file / add-file pairs atomically:
+
+```elixir
+# Compact the whole table
+AshDelta.optimize(Demo.Telemetry.Event)
+```
+
+```elixir
+# Compact only one partition — useful when recent partitions are hot
+AshDelta.optimize(Demo.Telemetry.Event,
+  partition: %{site: "CHI", day: ~D[2026-06-11]})
+```
+
+### VACUUM: reclaim S3 storage
+
+VACUUM physically deletes S3 objects whose `removed_version` is older than `vacuum_retention_hours`. Time-travel queries inside the retention window continue to work; older ones may fail because the files are gone.
+
+```elixir
+AshDelta.vacuum(Demo.Telemetry.Event)
+```
+
+### Bulk delete via copy-on-write
+
+Delete-where rewrites every affected Parquet file, excluding matching rows:
+
+```elixir
+import Ash.Expr, only: [expr: 1]
+  
+AshDelta.delete_where(Demo.Telemetry.Event,
+  expr(site == "CHI" and day == ^~D[2026-06-01]))
+```
+
+## Materialized Views
+
+`AshDelta.ViewLayer` defines a resource whose data is derived from one or more base tables. Reads are identical to base tables — the same pruning and DuckDB scan apply, and time travel works against the view's own commit history.
+
+```elixir
+defmodule Demo.Telemetry.DailySummary do
+  use Ash.Resource,
+    domain: Demo.Telemetry,
+    data_layer: AshDelta.ViewLayer
+
+  delta_view do
+    repo   Demo.Repo
+    bucket "demo-lake"
+    prefix "telemetry/daily_summaries"
+
+    # Source tables; changes here trigger freshness checks.
+    # Plain list auto-assigns the alias :source for use in the query below.
+    sources [Demo.Telemetry.Event]
+
+    # Must match a subset of every source's partition_by for incremental
+    # refresh to be correct.
+    partition_by [:site, :day]
+
+    refresh :partition_incremental
+
+    # DuckDB query populating the view. Each alias declared in `sources`
+    # is substituted with read_parquet([…]) over that source's live files.
+    query """
+    SELECT
+      site,
+      day,
+      sensor_id,
+      COUNT(*)       AS reading_count,
+      AVG(value)     AS avg_value,
+      MIN(value)     AS min_value,
+      MAX(value)     AS max_value
+    FROM source
+    GROUP BY site, day, sensor_id
+    """
+
+    # Trigger auto-refresh when the view is this stale.
+    freshness max_staleness: {5, :minute}
+
+    s3_config access_key_id:     System.get_env("AWS_ACCESS_KEY_ID", "any"),
+              secret_access_key: System.get_env("AWS_SECRET_ACCESS_KEY", "any"),
+              region:            System.get_env("AWS_REGION", "us-east-1"),
+              endpoint:          "#{System.get_env("S3_SCHEME", "http://")}#{System.get_env("S3_HOST", "localhost")}:#{System.get_env("S3_PORT", "8333")}"
+  end
+
+  attributes do
+    uuid_primary_key :id
+    attribute :site,          :string,  public?: true
+    attribute :day,           :date,    public?: true
+    attribute :sensor_id,     :string,  public?: true
+    attribute :reading_count, :integer, public?: true
+    attribute :avg_value,     :float,   public?: true
+    attribute :min_value,     :float,   public?: true
+    attribute :max_value,     :float,   public?: true
+  end
+
+  actions do
+    defaults [:read]
+  end
+end
+```
+
+```elixir
+# Refresh the view (incremental by default)
+AshDelta.refresh(Demo.Telemetry.DailySummary)
+```
+
+```elixir
+# Force a full rebuild
+AshDelta.refresh(Demo.Telemetry.DailySummary, strategy: :recompute)
+```
+
+```elixir
+require Ash.Query
+
+# Query the view — same API as the base table
+Demo.Telemetry.DailySummary
+|> Ash.Query.filter(site == "CHI")
+|> Ash.Query.sort(day: :desc)
+|> Ash.read!()
+```
+
+```elixir
+
+```
+
+## Summary
+
+| Concern                     | Component                                                        |
+| --------------------------- | ---------------------------------------------------------------- |
+| Schema and actions          | Ash resource DSL                                                 |
+| Column layout + compression | Parquet via Explorer / Polars                                    |
+| File storage                | S3 via ExAws                                                     |
+| Transaction log             | Postgres (`delta_tables`, `delta_commits`, `delta_files`)        |
+| Row-group scan              | DuckDB via Duckdbex                                              |
+| Partition pruning           | `AshDelta.Pruner` → JSONB `@>` containment predicates          |
+| Stats pruning               | `AshDelta.Pruner` → `column_stats` interval overlap predicates |
+| SQL filter compilation      | `AshDelta.Sql` → parameterised DuckDB `WHERE` clause           |
+| Compaction                  | `AshDelta.optimize/2`                                            |
+| Retention                   | `AshDelta.vacuum/2`                                              |
+| Time travel                 | `Ash.Query.set_context(%{delta: %{version: v}})`                 |
+| Derived tables              | `AshDelta.ViewLayer` + `AshDelta.refresh/2`                      |
+
+AshDelta gives you a Lakehouse storage layer for append-heavy analytical workloads while keeping the full Ash resource model. Validations, policies, code interfaces, and other extensions all work exactly as they do on any other resource.
