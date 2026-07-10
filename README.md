@@ -54,6 +54,66 @@ Postgres buys:
 | `VACUUM`                    | `AshDelta.vacuum/2`                           |
 | Checkpoints                 | Unnecessary — Postgres is materialized state  |
 
+## Getting Started
+
+### Requirements
+
+- Elixir ~> 1.17
+- PostgreSQL (stores the transaction log, file manifest, and column stats)
+- An S3-compatible object store (AWS S3, MinIO, etc.)
+- A Docker Compose file is included for running Postgres and a local S3 (MinIO) during development
+
+### Install dependencies
+
+```bash
+docker-compose up          # starts Postgres + MinIO
+mix deps.get
+```
+
+Add to your `mix.exs`:
+
+```elixir
+def deps do
+  [
+    {:ash_delta, "~> 0.1"},
+    {:ash, "~> 3.0"},
+    {:ecto_sql, "~> 3.11"},
+    {:postgrex, "~> 0.19"},
+    {:explorer, "~> 0.10"},   # Parquet encode/decode
+    {:duckdbex, "~> 0.3"},    # columnar scans
+    {:ex_aws, "~> 2.5"},
+    {:ex_aws_s3, "~> 2.5"},
+    {:jason, "~> 1.4"},
+    {:uniq, "~> 0.6"}
+  ]
+end
+```
+
+### Run migrations
+
+Generate and run the AshDelta metadata tables in your Postgres repo:
+
+```elixir
+defmodule MyApp.Repo.Migrations.InstallAshDelta do
+  use Ecto.Migration
+  use AshDelta.Migrations
+end
+```
+
+```bash
+mix ecto.migrate
+```
+
+### Configure S3 credentials
+
+```elixir
+# config/config.exs
+config :ex_aws,
+  access_key_id: System.get_env("AWS_ACCESS_KEY_ID"),
+  secret_access_key: System.get_env("AWS_SECRET_ACCESS_KEY"),
+  region: "us-east-1"
+```
+
 ## Install
 
 ```elixir

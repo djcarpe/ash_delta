@@ -110,6 +110,9 @@ defmodule AshDelta.DataLayer do
   def can?(_, {:filter_expr, %Ash.Query.Operator.LessThanOrEqual{}}), do: true
   def can?(_, {:filter_expr, %Ash.Query.Operator.GreaterThanOrEqual{}}), do: true
   def can?(_, {:filter_expr, %Ash.Query.Function.IsNil{}}), do: true
+  def can?(_, {:filter_expr, %Ash.Query.Function.StringStartsWith{}}), do: true
+  def can?(_, {:filter_expr, %Ash.Query.Function.StringEndsWith{}}), do: true
+  def can?(_, {:filter_expr, %Ash.Query.Function.Contains{}}), do: true
   def can?(_, :boolean_filters), do: true
   def can?(_, :sort), do: true
   def can?(_, {:sort, _}), do: true

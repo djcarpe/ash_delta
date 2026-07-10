@@ -75,6 +75,15 @@ defmodule AshDelta.Sql do
   defp walk(%Ash.Query.Function.IsNil{arguments: [arg]}),
     do: {"#{operand!(arg)} IS NULL", []}
 
+  defp walk(%Ash.Query.Function.StringStartsWith{arguments: [l, r]}) when is_binary(r),
+    do: {"#{operand!(l)} LIKE ? ESCAPE '\\'", [escape_like(r) <> "%"]}
+
+  defp walk(%Ash.Query.Function.StringEndsWith{arguments: [l, r]}) when is_binary(r),
+    do: {"#{operand!(l)} LIKE ? ESCAPE '\\'", ["%" <> escape_like(r)]}
+
+  defp walk(%Ash.Query.Function.Contains{arguments: [l, r]}) when is_binary(r),
+    do: {"#{operand!(l)} LIKE ? ESCAPE '\\'", ["%" <> escape_like(r) <> "%"]}
+
   defp walk(%Ash.Filter.Simple.Not{predicate: predicate}) do
     {sql, params} = walk(predicate)
     {"NOT (#{sql})", params}
@@ -90,6 +99,14 @@ defmodule AshDelta.Sql do
 
   defp binary(left, op, right) do
     {"#{operand!(left)} #{op} ?", [dump(right)]}
+  end
+
+  # Escape LIKE metacharacters in user-supplied fragments (ESCAPE '\').
+  defp escape_like(value) do
+    value
+    |> String.replace("\\", "\\\\")
+    |> String.replace("%", "\\%")
+    |> String.replace("_", "\\_")
   end
 
   defp operand!(%Ref{attribute: %{name: name}, relationship_path: []}), do: ~s("#{name}")
